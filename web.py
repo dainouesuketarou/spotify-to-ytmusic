@@ -1,0 +1,410 @@
+"""Local web UI for queueing playlists, watching progress and re-syncing Spotify.
+
+The server holds live Spotify and YouTube credentials, so it refuses to listen on
+anything but the loopback interface unless WEB_TOKEN is set.
+"""
+
+import os
+import re
+import secrets
+import threading
+import time
+from collections import deque
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
+
+import db
+import runner
+import spotify_client as sp_api
+import sync as sync_mod
+
+HERE = Path(__file__).parent
+TOKEN = os.getenv("WEB_TOKEN", "").strip()
+# A token that may queue playlists and start a run, but not delete or edit - for phones.
+QUEUE_TOKEN = os.getenv("WEB_QUEUE_TOKEN", "").strip()
+# A token that may read but never change anything.
+VIEW_TOKEN = os.getenv("WEB_VIEW_TOKEN", "").strip()
+HOST = os.getenv("WEB_HOST", "127.0.0.1").strip()
+PORT = int(os.getenv("WEB_PORT", "8765"))
+
+VIDEO_ID = re.compile(r"(?:v=|youtu\.be/|/embed/)([A-Za-z0-9_-]{11})")
+
+app = FastAPI(title="spotify-to-ytmusic")
+
+# --------------------------------------------------------------------------- run state
+
+_run_log = deque(maxlen=400)
+_run_state = {"active": False, "summary": None, "error": None}
+_lock = threading.Lock()
+
+
+def _emit(kind, message):
+    _run_log.append({"kind": kind, "message": message, "at": time.time()})
+
+
+def _run_thread(limit):
+    try:
+        summary = runner.run_once(on_event=_emit, limit=limit)
+        with _lock:
+            _run_state["summary"] = summary
+    except runner.AlreadyRunning as e:
+        with _lock:
+            _run_state["error"] = str(e)
+    except Exception as e:
+        _emit("error", str(e))
+        with _lock:
+            _run_state["error"] = str(e)
+    finally:
+        with _lock:
+            _run_state["active"] = False
+
+
+# --------------------------------------------------------------------------- spotify
+
+_spotify = {"client": None, "playlists": None, "at": 0.0}
+
+
+def spotify():
+    if _spotify["client"] is None:
+        cache = HERE / ".spotify_token.json"
+        if not cache.exists():
+            raise HTTPException(
+                503,
+                "Spotify が未認可。ターミナルで `make list` を一度実行して認可してください。",
+            )
+        _spotify["client"] = sp_api.client()
+    return _spotify["client"]
+
+
+def spotify_playlists(max_age=60):
+    if _spotify["playlists"] is None or time.time() - _spotify["at"] > max_age:
+        _spotify["playlists"] = sp_api.playlists(spotify())
+        _spotify["at"] = time.time()
+    return _spotify["playlists"]
+
+
+# --------------------------------------------------------------------------- auth
+
+# What each role may change, as (method, path, exact?). Anything not listed is
+# read-only. Matching on the method matters: a prefix alone would let a queue
+# token reach DELETE /api/queue/<id>.
+WRITABLE = {
+    "admin": None,  # everything
+    # Enough to say "migrate this playlist" from a phone: queue it, pull it in,
+    # and kick off a run. Deleting, retrying and hand-editing stay on the Mac.
+    "queue": (
+        ("POST", "/api/queue", True),
+        ("POST", "/api/sync", False),  # also /api/sync/<playlist_id>
+        ("POST", "/api/run", True),
+    ),
+    "viewer": (),
+}
+
+
+def _role_for(supplied):
+    if not TOKEN and not QUEUE_TOKEN and not VIEW_TOKEN:
+        return "admin"
+    for token, role in ((TOKEN, "admin"), (QUEUE_TOKEN, "queue"), (VIEW_TOKEN, "viewer")):
+        if token and secrets.compare_digest(supplied, token):
+            return role
+    return None
+
+
+def _may_write(role, method, path):
+    allowed = WRITABLE.get(role, ())
+    if allowed is None:
+        return True
+    return any(
+        method == m and (path == route if exact else
+                         path == route or path.startswith(route + "/"))
+        for m, route, exact in allowed
+    )
+
+
+@app.middleware("http")
+async def guard(request: Request, call_next):
+    supplied = (
+        request.query_params.get("t")
+        or request.headers.get("x-token")
+        or request.cookies.get("token")
+        or ""
+    )
+    role = _role_for(supplied)
+    if role is None:
+        return JSONResponse({"detail": "認証が必要"}, status_code=401)
+    if request.method not in ("GET", "HEAD") and not _may_write(
+        role, request.method, request.url.path
+    ):
+        detail = ("閲覧専用のため操作できません" if role == "viewer"
+                  else "このトークンでは実行できない操作です")
+        return JSONResponse({"detail": detail}, status_code=403)
+
+    request.state.role = role
+    response = await call_next(request)
+    if request.query_params.get("t"):
+        response.set_cookie(
+            "token", supplied, httponly=True, samesite="lax", max_age=60 * 60 * 24 * 90
+        )
+    return response
+
+
+@app.get("/api/me")
+def me(request: Request):
+    return {"role": getattr(request.state, "role", "admin")}
+
+
+# --------------------------------------------------------------------------- pages
+
+@app.get("/")
+def index():
+    return FileResponse(HERE / "static" / "index.html")
+
+
+# --------------------------------------------------------------------------- api
+
+def _progress(conn, playlist_id):
+    rows = conn.execute(
+        "SELECT status, COUNT(*) n FROM tracks WHERE playlist_id = ? GROUP BY status",
+        (playlist_id,),
+    ).fetchall()
+    return {r["status"]: r["n"] for r in rows}
+
+
+@app.get("/api/overview")
+def overview():
+    conn = db.connect()
+    used = db.quota_used(conn)
+    counts = {
+        r["status"]: r["n"]
+        for r in conn.execute("SELECT status, COUNT(*) n FROM tracks GROUP BY status")
+    }
+    open_left = sum(counts.get(s, 0) for s in db.OPEN)
+    last = conn.execute(
+        "SELECT * FROM runs WHERE finished_at IS NOT NULL ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    with _lock:
+        active = _run_state["active"]
+        error = _run_state["error"]
+    return {
+        "quota": {"used": used, "budget": runner.DAILY_BUDGET,
+                  "tracks_left_today": max(0, (runner.DAILY_BUDGET - used) // runner.UNITS_PER_TRACK),
+                  "day": db.today()},
+        "counts": counts,
+        "open": open_left,
+        "eta_days": -(-open_left // runner.TRACKS_PER_DAY) if open_left else 0,
+        "running": active or runner.is_running(),
+        "error": error,
+        "last_run": dict(last) if last else None,
+    }
+
+
+@app.get("/api/upcoming")
+def upcoming(limit: int = 30):
+    """The next tracks the runner will touch, in the order it will touch them."""
+    conn = db.connect()
+    placeholders = ",".join("?" * len(db.OPEN))
+    rows = conn.execute(
+        f"SELECT t.id, t.title, t.artists, t.status, p.name AS playlist "
+        f"FROM tracks t JOIN playlists p ON p.spotify_id = t.playlist_id "
+        f"WHERE t.status IN ({placeholders}) AND p.paused = 0 "
+        f"ORDER BY p.added_at, t.position LIMIT ?",
+        (*db.OPEN, limit),
+    ).fetchall()
+    return {"tracks": [dict(r) for r in rows], "per_day": runner.TRACKS_PER_DAY}
+
+
+@app.get("/api/playlists")
+def list_playlists(refresh: bool = False):
+    conn = db.connect()
+    queued = {r["spotify_id"]: r for r in sync_mod.queued_playlists(conn)}
+    items = spotify_playlists(max_age=0 if refresh else 60)
+    out = []
+    for p in items:
+        if not p["owned"]:
+            continue
+        row = queued.get(p["id"])
+        counts = _progress(conn, p["id"]) if row else {}
+        out.append({
+            **p,
+            "queued": row is not None,
+            "paused": bool(row["paused"]) if row else False,
+            "stale": bool(row and row["snapshot_id"] != p.get("snapshot_id")),
+            "synced_at": row["synced_at"] if row else None,
+            "yt_id": row["yt_id"] if row else None,
+            "counts": counts,
+            "done": counts.get(db.ADDED, 0),
+        })
+    liked = queued.get(sp_api.LIKED_ID)
+    liked_counts = _progress(conn, sp_api.LIKED_ID) if liked else {}
+    out.append({
+        "id": sp_api.LIKED_ID, "name": "Liked Songs", "owned": True,
+        "total": liked["total"] if liked else None,
+        "queued": liked is not None,
+        "paused": bool(liked["paused"]) if liked else False,
+        "stale": False,
+        "synced_at": liked["synced_at"] if liked else None,
+        "yt_id": liked["yt_id"] if liked else None,
+        "counts": liked_counts,
+        "done": liked_counts.get(db.ADDED, 0),
+    })
+    return {"playlists": out, "hidden_not_owned": sum(1 for p in items if not p["owned"])}
+
+
+@app.post("/api/queue")
+def enqueue(payload: dict = Body(...)):
+    ids = payload.get("ids") or []
+    if not ids:
+        raise HTTPException(400, "ids が空")
+    conn = db.connect()
+    sp = spotify()
+    return {"results": [sync_mod.sync_playlist(conn, sp, i, force=True) for i in ids]}
+
+
+@app.delete("/api/queue/{playlist_id}")
+def dequeue(playlist_id: str):
+    conn = db.connect()
+    conn.execute("DELETE FROM tracks WHERE playlist_id = ?", (playlist_id,))
+    conn.execute("DELETE FROM playlists WHERE spotify_id = ?", (playlist_id,))
+    conn.commit()
+    return {"ok": True}
+
+
+@app.post("/api/queue/{playlist_id}/pause")
+def pause(playlist_id: str, payload: dict = Body(...)):
+    conn = db.connect()
+    conn.execute(
+        "UPDATE playlists SET paused = ? WHERE spotify_id = ?",
+        (1 if payload.get("paused") else 0, playlist_id),
+    )
+    conn.commit()
+    return {"ok": True}
+
+
+@app.get("/api/queue/{playlist_id}/tracks")
+def playlist_tracks(playlist_id: str, status: str = "", q: str = ""):
+    conn = db.connect()
+    sql = "SELECT * FROM tracks WHERE playlist_id = ?"
+    params = [playlist_id]
+    if status:
+        wanted = status.split(",")
+        sql += f" AND status IN ({','.join('?' * len(wanted))})"
+        params += wanted
+    if q:
+        sql += " AND (title LIKE ? OR artists LIKE ?)"
+        params += [f"%{q}%", f"%{q}%"]
+    sql += " ORDER BY position LIMIT 1000"
+    return {"tracks": [dict(r) for r in conn.execute(sql, params)]}
+
+
+@app.post("/api/sync")
+def sync_everything(payload: dict = Body(default={})):
+    conn = db.connect()
+    results = sync_mod.sync_all(conn, spotify(), force=bool(payload.get("force")))
+    _spotify["playlists"] = None
+    return {"results": results}
+
+
+@app.post("/api/sync/{playlist_id}")
+def sync_one(playlist_id: str, payload: dict = Body(default={})):
+    conn = db.connect()
+    result = sync_mod.sync_playlist(conn, spotify(), playlist_id, force=bool(payload.get("force")))
+    _spotify["playlists"] = None
+    return result
+
+
+@app.post("/api/run")
+def start_run(payload: dict = Body(default={})):
+    with _lock:
+        if _run_state["active"]:
+            raise HTTPException(409, "すでに実行中")
+        _run_state.update(active=True, summary=None, error=None)
+    _run_log.clear()
+    threading.Thread(target=_run_thread, args=(payload.get("limit"),), daemon=True).start()
+    return {"started": True}
+
+
+@app.get("/api/run/log")
+def run_log(after: float = 0.0):
+    with _lock:
+        state = dict(_run_state)
+    return {"events": [e for e in list(_run_log) if e["at"] > after], **state}
+
+
+@app.post("/api/retry")
+def retry(payload: dict = Body(default={})):
+    conn = db.connect()
+    statuses = payload.get("statuses") or [db.UNMATCHED, db.FAILED]
+    n = conn.execute(
+        f"UPDATE tracks SET status = ?, yt_video_id = NULL, note = NULL "
+        f"WHERE status IN ({','.join('?' * len(statuses))})",
+        (db.PENDING, *statuses),
+    ).rowcount
+    conn.commit()
+    return {"reset": n, "units": n * runner.UNITS_PER_TRACK}
+
+
+@app.post("/api/tracks/{track_id}/resolve")
+def resolve(track_id: int, payload: dict = Body(...)):
+    """Pin a YouTube video by hand for a track the matcher could not place."""
+    raw = (payload.get("video") or "").strip()
+    m = VIDEO_ID.search(raw)
+    video_id = m.group(1) if m else raw
+    if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+        raise HTTPException(400, "YouTube の動画 ID か URL を指定してください")
+    conn = db.connect()
+    conn.execute(
+        "UPDATE tracks SET yt_video_id = ?, status = ?, note = ? WHERE id = ?",
+        (video_id, db.SEARCHED, "手動指定", track_id),
+    )
+    conn.commit()
+    return {"ok": True, "video_id": video_id}
+
+
+@app.post("/api/tracks/{track_id}/skip")
+def skip(track_id: int):
+    conn = db.connect()
+    conn.execute("UPDATE tracks SET status = ? WHERE id = ?", (db.REMOVED, track_id))
+    conn.commit()
+    return {"ok": True}
+
+
+def _lan_address():
+    """Best-effort LAN address, so the printed URL is one a phone can actually open."""
+    import socket
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))  # no packet is sent; this just picks the route
+        return s.getsockname()[0]
+    except OSError:
+        return HOST
+    finally:
+        s.close()
+
+
+def main():
+    import uvicorn
+
+    if HOST not in ("127.0.0.1", "localhost") and not TOKEN:
+        raise SystemExit(
+            f"WEB_HOST={HOST} で公開するには WEB_TOKEN が必須です。\n"
+            "  python -c \"import secrets; print(secrets.token_urlsafe(32))\"\n"
+            "で生成した値を .env の WEB_TOKEN に設定してください。"
+        )
+    shown = "127.0.0.1" if HOST in ("127.0.0.1", "localhost") else _lan_address()
+    print(f"操作用: http://{shown}:{PORT}/" + (f"?t={TOKEN}" if TOKEN else ""), flush=True)
+    if QUEUE_TOKEN:
+        print(f"登録用: http://{shown}:{PORT}/?t={QUEUE_TOKEN}  (登録と実行・スマホ用)", flush=True)
+    if VIEW_TOKEN:
+        print(f"閲覧用: http://{shown}:{PORT}/?t={VIEW_TOKEN}  (閲覧のみ)", flush=True)
+    uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
+
+
+if __name__ == "__main__":
+    main()

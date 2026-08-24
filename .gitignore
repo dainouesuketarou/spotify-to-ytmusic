@@ -1,0 +1,22 @@
+# 認証情報
+.env
+.spotify_token.json
+.youtube_token.json
+
+# 実行状態
+migrate.db
+migrate.db-wal
+migrate.db-shm
+.run.lock
+unmatched.csv
+
+# ログ
+run.log
+web-server.log
+
+# 環境
+.venv/
+__pycache__/
+*.pyc
+*.bak
+.DS_Store
