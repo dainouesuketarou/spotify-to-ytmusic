@@ -5,11 +5,13 @@ anything but the loopback interface unless WEB_TOKEN is set.
 """
 
 import os
+import plistlib
 import re
 import secrets
 import threading
 import time
 from collections import deque
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -34,6 +36,8 @@ HOST = os.getenv("WEB_HOST", "127.0.0.1").strip()
 PORT = int(os.getenv("WEB_PORT", "8765"))
 
 VIDEO_ID = re.compile(r"(?:v=|youtu\.be/|/embed/)([A-Za-z0-9_-]{11})")
+
+AGENT_PLIST = Path.home() / "Library/LaunchAgents/com.spotify-to-ytmusic.daily.plist"
 
 app = FastAPI(title="spotify-to-ytmusic")
 
@@ -168,6 +172,32 @@ def index():
 
 # --------------------------------------------------------------------------- api
 
+def _next_run():
+    """When the LaunchAgent will next fire, read from the installed plist."""
+    if not AGENT_PLIST.exists():
+        return {"installed": False}
+    try:
+        when = plistlib.loads(AGENT_PLIST.read_bytes()).get("StartCalendarInterval") or {}
+        hour, minute = when.get("Hour"), when.get("Minute", 0)
+    except Exception:
+        return {"installed": False}
+    if hour is None:
+        return {"installed": True, "at": None}
+
+    now = datetime.now().astimezone()
+    nxt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if nxt <= now:
+        nxt += timedelta(days=1)
+    return {"installed": True, "hour": hour, "minute": minute, "at": nxt.isoformat()}
+
+
+def _quota_resets_at():
+    """Next midnight in US Pacific, expressed in this machine's local time."""
+    now_pt = datetime.now(db.PACIFIC)
+    midnight = (now_pt + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight.astimezone().isoformat()
+
+
 def _progress(conn, playlist_id):
     rows = conn.execute(
         "SELECT status, COUNT(*) n FROM tracks WHERE playlist_id = ? GROUP BY status",
@@ -194,7 +224,8 @@ def overview():
     return {
         "quota": {"used": used, "budget": runner.DAILY_BUDGET,
                   "tracks_left_today": max(0, (runner.DAILY_BUDGET - used) // runner.UNITS_PER_TRACK),
-                  "day": db.today()},
+                  "day": db.today(), "resets_at": _quota_resets_at()},
+        "schedule": _next_run(),
         "counts": counts,
         "open": open_left,
         "eta_days": -(-open_left // runner.TRACKS_PER_DAY) if open_left else 0,

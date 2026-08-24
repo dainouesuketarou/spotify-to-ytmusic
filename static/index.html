@@ -89,6 +89,7 @@ body.queueonly .tk button{display:none}
     </div>
     <div class="bar" style="margin-top:8px"><i id="qbar" style="width:0"></i></div>
     <div class="muted" id="qtext" style="margin-top:6px">読み込み中…</div>
+    <div class="muted" id="sched" style="margin-top:3px"></div>
   </div>
 </header>
 
@@ -153,6 +154,13 @@ const post = (p, body) => api(p, {method:'POST', body: JSON.stringify(body || {}
 const el = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
+const clock = iso => new Date(iso).toLocaleString('ja-JP',
+  {month:'numeric', day:'numeric', hour:'2-digit', minute:'2-digit'});
+function until(iso){
+  const m = Math.max(0, Math.round((new Date(iso) - Date.now()) / 60000));
+  return m >= 60 ? `${Math.floor(m/60)}時間${m%60}分後` : `${m}分後`;
+}
+
 let playlists = [], selected = new Set(), current = null, curStatus = '', logAt = 0;
 let role = 'admin', readonly = false, canQueue = true, todayIds = new Set(), perDay = 66;
 
@@ -189,6 +197,21 @@ async function loadOverview(){
   el('qtext').textContent =
     `本日 ${o.quota.used}/${o.quota.budget} units · 今日あと ${o.quota.tracks_left_today} 曲 · `
     + `残り ${o.open} 曲` + (o.eta_days ? ` · 完了まで約 ${o.eta_days} 日` : ' · 完了');
+  const lines = [];
+  if (o.schedule?.at){
+    lines.push(`次回の自動実行 ${clock(o.schedule.at)}（${until(o.schedule.at)}）`);
+  } else if (o.schedule && !o.schedule.installed){
+    lines.push('自動実行は未登録（make install-agent）');
+  }
+  if (o.quota.tracks_left_today === 0 && o.quota.resets_at){
+    lines.push(`クォータ回復 ${clock(o.quota.resets_at)}（${until(o.quota.resets_at)}）`);
+  }
+  const r = o.last_run;
+  if (r) lines.push(`前回 ${clock(r.started_at)} · ${r.added} 曲追加`
+    + (r.unmatched ? ` / 未マッチ ${r.unmatched}` : '')
+    + (r.failed ? ` / 失敗 ${r.failed}` : '') + ` · ${r.outcome}`);
+  el('sched').innerHTML = lines.map(esc).join('<br>');
+
   el('run').disabled = o.running || o.quota.tracks_left_today === 0;
   el('run').textContent = o.running ? '実行中…' : '今すぐ実行';
   if (o.running && !readonly) pollLog();
