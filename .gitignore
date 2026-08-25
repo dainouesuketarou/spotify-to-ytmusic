@@ -1,6 +1,7 @@
 # 認証情報
 .env
 .spotify_token.json
+.spotify_playlists.json
 .youtube_token.json
 
 # 実行状態

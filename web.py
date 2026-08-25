@@ -76,6 +76,10 @@ def _run_thread(limit):
 
 _spotify = {"client": None, "playlists": None, "at": 0.0}
 
+# The last listing Spotify gave us, kept on disk so the picker survives a
+# rate-limit window or a server restart.
+LISTING_CACHE = HERE / ".spotify_playlists.json"
+
 # While Spotify is rate-limiting us, stop calling it entirely: every extra
 # request during the window pushes the reset further out.
 _cooldown = {"until": 0.0}
@@ -137,10 +141,31 @@ def spotify():
     return _spotify["client"]
 
 
+def _save_listing(items, liked_total):
+    try:
+        LISTING_CACHE.write_text(json.dumps(
+            {"at": time.time(), "playlists": items, "liked_total": liked_total},
+            ensure_ascii=False,
+        ))
+    except OSError:
+        pass
+
+
+def _load_listing():
+    try:
+        return json.loads(LISTING_CACHE.read_text())
+    except (OSError, ValueError):
+        return None
+
+
 def spotify_playlists(max_age=300):
     if _spotify["playlists"] is None or time.time() - _spotify["at"] > max_age:
-        _spotify["playlists"] = sp_api.playlists(spotify())
+        sp = spotify()
+        items = sp_api.playlists(sp)
+        liked = sp_api.playlist_meta(sp, sp_api.LIKED_ID)["total"]
+        _spotify["playlists"] = items
         _spotify["at"] = time.time()
+        _save_listing(items, liked)
     return _spotify["playlists"]
 
 
@@ -341,16 +366,27 @@ def list_playlists(refresh: bool = False):
     conn = db.connect()
     queued = {r["spotify_id"]: r for r in sync_mod.queued_playlists(conn)}
 
-    remote, error = [], None
+    remote, error, liked_total, cached_at = [], None, None, None
     try:
         remote = spotify_playlists(max_age=0 if refresh else 300)
-    except HTTPException as e:
-        error = _cooldown_message() if cooldown_left() else str(e.detail)
-    except SpotifyException as e:
-        _enter_cooldown()
-        error = _cooldown_message()
-    except Exception as e:
-        error = f"Spotify に接続できません: {e}"
+        saved = _load_listing() or {}
+        liked_total = saved.get("liked_total")
+    except (HTTPException, SpotifyException, Exception) as e:
+        if isinstance(e, SpotifyException):
+            _enter_cooldown()
+        if cooldown_left():
+            error = _cooldown_message()
+        elif isinstance(e, HTTPException):
+            error = str(e.detail)
+        else:
+            error = f"Spotify に接続できません: {e}"
+
+        # Fall back to the last listing we managed to fetch.
+        saved = _load_listing()
+        if saved:
+            remote = saved.get("playlists", [])
+            liked_total = saved.get("liked_total")
+            cached_at = saved.get("at")
 
     out, seen = [], set()
 
@@ -373,12 +409,13 @@ def list_playlists(refresh: bool = False):
         out.append(_entry(p["id"], p["name"], p["total"], None, {}))
 
     if sp_api.LIKED_ID not in seen:
-        out.append(_entry(sp_api.LIKED_ID, "Liked Songs", None, None, {}))
+        out.append(_entry(sp_api.LIKED_ID, "Liked Songs", liked_total, None, {}))
 
     return {
         "playlists": out,
         "hidden_not_owned": sum(1 for p in remote if not p["owned"]),
         "spotify_error": error,
+        "listing_cached_at": cached_at,
     }
 
 

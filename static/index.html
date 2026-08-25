@@ -241,8 +241,10 @@ async function loadPlaylists(refresh){
     // not-yet-queued playlists needs Spotify.
     el('plerr').hidden = !d.spotify_error;
     if (d.spotify_error){
-      el('plerr').textContent = d.spotify_error
-        + '（登録済みの進捗は下に表示しています。未登録のプレイリストは一時的に選べません）';
+      const age = d.listing_cached_at
+        ? `一覧は ${clock(new Date(d.listing_cached_at * 1000).toISOString())} 時点のキャッシュを表示しています。`
+        : '未登録のプレイリストは一時的に表示できません。';
+      el('plerr').textContent = `${d.spotify_error} ${age} 進捗の表示と自動実行には影響しません。`;
     }
     render();
   } catch(e){
