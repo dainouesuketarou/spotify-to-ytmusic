@@ -12,6 +12,14 @@ CACHE = Path(__file__).parent / ".spotify_token.json"
 LIKED_ID = "__liked__"  # pseudo playlist id for Liked Songs
 
 
+class RateLimited(Exception):
+    """Spotify returned 429. Carries how long it asked us to wait."""
+
+    def __init__(self, retry_after):
+        self.retry_after = retry_after
+        super().__init__(f"Spotify のレート制限中。約 {retry_after} 秒後に再試行してください。")
+
+
 def client():
     return spotipy.Spotify(
         auth_manager=SpotifyOAuth(
@@ -21,8 +29,23 @@ def client():
             # Always show the approval dialog so the acting account is visible and switchable.
             show_dialog=True,
         ),
-        requests_timeout=30,
+        requests_timeout=20,
+        # spotipy honours Retry-After by sleeping, which can block for hours on a
+        # 429. Fail fast instead and let the caller report it.
+        retries=0,
     )
+
+
+_ME = {}
+
+
+def current_user_id(sp):
+    """Cached: this was previously one /me call per playlist, which is what
+    pushed us into Spotify's rate limit."""
+    key = id(sp)
+    if key not in _ME:
+        _ME[key] = sp.current_user()["id"]
+    return _ME[key]
 
 
 def _total(playlist):
@@ -32,10 +55,6 @@ def _total(playlist):
         if isinstance(holder, dict) and "total" in holder:
             return holder["total"]
     return 0
-
-
-def current_user_id(sp):
-    return sp.current_user()["id"]
 
 
 def playlists(sp):

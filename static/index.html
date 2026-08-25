@@ -146,9 +146,16 @@ body.queueonly .tk button{display:none}
 const T = new URLSearchParams(location.search).get('t');
 const api = async (path, opts={}) => {
   const url = path + (T ? (path.includes('?') ? '&' : '?') + 't=' + encodeURIComponent(T) : '');
-  const r = await fetch(url, {headers:{'Content-Type':'application/json'}, ...opts});
-  if (!r.ok) throw new Error((await r.json().catch(()=>({}))).detail || r.status);
-  return r.json();
+  // Without a deadline a stalled upstream leaves the page saying "読み込み中" forever.
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), opts.timeout || 30000);
+  try {
+    const r = await fetch(url, {headers:{'Content-Type':'application/json'}, signal: ac.signal, ...opts});
+    if (!r.ok) throw new Error((await r.json().catch(()=>({}))).detail || `HTTP ${r.status}`);
+    return r.json();
+  } catch (e) {
+    throw new Error(e.name === 'AbortError' ? '応答がありません（タイムアウト）' : e.message);
+  } finally { clearTimeout(timer); }
 };
 const post = (p, body) => api(p, {method:'POST', body: JSON.stringify(body || {})});
 const el = id => document.getElementById(id);
@@ -230,7 +237,11 @@ async function loadPlaylists(refresh){
     el('hint').textContent = d.hidden_not_owned
       ? `他人が作成した ${d.hidden_not_owned} 件は Spotify の制限で移行できないため非表示。` : '';
     render();
-  } catch(e){ el('list').innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+  } catch(e){
+    el('list').innerHTML = `<div class="err">${esc(e.message)}</div>`
+      + '<div class="muted" style="margin-top:6px">「再取得」で再試行できます。'
+      + '進捗の表示と自動実行には影響しません。</div>';
+  }
 }
 
 function fold(id, kind, label, count){
@@ -447,7 +458,7 @@ el('dbody').addEventListener('click', async e => {
 
 async function refreshAll(){
   await loadToday();
-  await Promise.all([loadOverview(), loadPlaylists(true)]);
+  await Promise.all([loadOverview(), loadPlaylists()]);
 }
 
 (async () => {

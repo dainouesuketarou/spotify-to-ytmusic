@@ -4,6 +4,7 @@ The server holds live Spotify and YouTube credentials, so it refuses to listen o
 anything but the loopback interface unless WEB_TOKEN is set.
 """
 
+import json
 import os
 import plistlib
 import re
@@ -14,12 +15,14 @@ from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
 from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
+from spotipy.exceptions import SpotifyException
 
 import db
 import runner
@@ -73,8 +76,51 @@ def _run_thread(limit):
 
 _spotify = {"client": None, "playlists": None, "at": 0.0}
 
+# While Spotify is rate-limiting us, stop calling it entirely: every extra
+# request during the window pushes the reset further out.
+_cooldown = {"until": 0.0}
+
+
+def cooldown_left():
+    return max(0, int(_cooldown["until"] - time.time()))
+
+
+def _retry_after_seconds():
+    """spotipy's retry layer discards the response, so ask Spotify directly."""
+    try:
+        cache = json.loads((HERE / ".spotify_token.json").read_text())
+        r = requests.get(
+            "https://api.spotify.com/v1/me",
+            headers={"Authorization": f"Bearer {cache['access_token']}"},
+            timeout=10,
+        )
+        if r.status_code == 429:
+            return int(r.headers.get("Retry-After", 60))
+        return 0
+    except Exception:
+        return 60
+
+
+def _enter_cooldown():
+    wait = _retry_after_seconds()
+    _cooldown["until"] = time.time() + wait
+    _spotify["playlists"] = None
+    return wait
+
+
+def _cooldown_response():
+    left = cooldown_left()
+    unit = f"{left // 60} 分" if left >= 60 else f"{left} 秒"
+    return JSONResponse(
+        {"detail": f"Spotify のレート制限中です。あと約 {unit} お待ちください。"},
+        status_code=429,
+        headers={"Retry-After": str(left or 60)},
+    )
+
 
 def spotify():
+    if cooldown_left():
+        raise HTTPException(429, "cooldown")
     if _spotify["client"] is None:
         cache = HERE / ".spotify_token.json"
         if not cache.exists():
@@ -86,7 +132,7 @@ def spotify():
     return _spotify["client"]
 
 
-def spotify_playlists(max_age=60):
+def spotify_playlists(max_age=300):
     if _spotify["playlists"] is None or time.time() - _spotify["at"] > max_age:
         _spotify["playlists"] = sp_api.playlists(spotify())
         _spotify["at"] = time.time()
@@ -164,6 +210,22 @@ def me(request: Request):
 
 
 # --------------------------------------------------------------------------- pages
+
+@app.exception_handler(SpotifyException)
+def spotify_error(request: Request, exc: SpotifyException):
+    """A 429 must surface as an error, not as a request that never returns."""
+    if exc.http_status == 429 or "Max Retries" in str(exc.msg or ""):
+        _enter_cooldown()
+        return _cooldown_response()
+    return JSONResponse({"detail": f"Spotify エラー: {exc.msg or exc}"}, status_code=502)
+
+
+@app.exception_handler(HTTPException)
+def http_error(request: Request, exc: HTTPException):
+    if exc.status_code == 429 and exc.detail == "cooldown":
+        return _cooldown_response()
+    return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+
 
 @app.get("/")
 def index():
@@ -254,7 +316,7 @@ def upcoming(limit: int = 30):
 def list_playlists(refresh: bool = False):
     conn = db.connect()
     queued = {r["spotify_id"]: r for r in sync_mod.queued_playlists(conn)}
-    items = spotify_playlists(max_age=0 if refresh else 60)
+    items = spotify_playlists(max_age=0 if refresh else 300)
     out = []
     for p in items:
         if not p["owned"]:
