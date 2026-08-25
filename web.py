@@ -108,11 +108,16 @@ def _enter_cooldown():
     return wait
 
 
-def _cooldown_response():
+def _cooldown_message():
     left = cooldown_left()
     unit = f"{left // 60} 分" if left >= 60 else f"{left} 秒"
+    return f"Spotify のレート制限中です。あと約 {unit} お待ちください。"
+
+
+def _cooldown_response():
+    left = cooldown_left()
     return JSONResponse(
-        {"detail": f"Spotify のレート制限中です。あと約 {unit} お待ちください。"},
+        {"detail": _cooldown_message()},
         status_code=429,
         headers={"Retry-After": str(left or 60)},
     )
@@ -312,41 +317,69 @@ def upcoming(limit: int = 30):
     return {"tracks": [dict(r) for r in rows], "per_day": runner.TRACKS_PER_DAY}
 
 
+def _entry(playlist_id, name, total, row, counts, *, owned=True, stale=False):
+    return {
+        "id": playlist_id,
+        "name": name,
+        "total": total,
+        "owned": owned,
+        "queued": row is not None,
+        "paused": bool(row["paused"]) if row else False,
+        "stale": stale,
+        "synced_at": row["synced_at"] if row else None,
+        "yt_id": row["yt_id"] if row else None,
+        "counts": counts,
+        "done": counts.get(db.ADDED, 0),
+    }
+
+
 @app.get("/api/playlists")
 def list_playlists(refresh: bool = False):
+    """Queued playlists come from the local database, so progress stays visible
+    even when Spotify is unreachable. Spotify only supplies the playlists that
+    have not been queued yet."""
     conn = db.connect()
     queued = {r["spotify_id"]: r for r in sync_mod.queued_playlists(conn)}
-    items = spotify_playlists(max_age=0 if refresh else 300)
-    out = []
-    for p in items:
-        if not p["owned"]:
+
+    remote, error = [], None
+    try:
+        remote = spotify_playlists(max_age=0 if refresh else 300)
+    except HTTPException as e:
+        error = _cooldown_message() if cooldown_left() else str(e.detail)
+    except SpotifyException as e:
+        _enter_cooldown()
+        error = _cooldown_message()
+    except Exception as e:
+        error = f"Spotify に接続できません: {e}"
+
+    out, seen = [], set()
+
+    # Everything already queued, straight from the database.
+    for pid, row in queued.items():
+        seen.add(pid)
+        remote_match = next((p for p in remote if p["id"] == pid), None)
+        stale = bool(remote_match and row["snapshot_id"] != remote_match.get("snapshot_id"))
+        out.append(_entry(
+            pid,
+            (remote_match or {}).get("name") or row["name"],
+            (remote_match or {}).get("total", row["total"]),
+            row, _progress(conn, pid), stale=stale,
+        ))
+
+    # Anything Spotify knows about that is not queued yet.
+    for p in remote:
+        if p["id"] in seen or not p["owned"]:
             continue
-        row = queued.get(p["id"])
-        counts = _progress(conn, p["id"]) if row else {}
-        out.append({
-            **p,
-            "queued": row is not None,
-            "paused": bool(row["paused"]) if row else False,
-            "stale": bool(row and row["snapshot_id"] != p.get("snapshot_id")),
-            "synced_at": row["synced_at"] if row else None,
-            "yt_id": row["yt_id"] if row else None,
-            "counts": counts,
-            "done": counts.get(db.ADDED, 0),
-        })
-    liked = queued.get(sp_api.LIKED_ID)
-    liked_counts = _progress(conn, sp_api.LIKED_ID) if liked else {}
-    out.append({
-        "id": sp_api.LIKED_ID, "name": "Liked Songs", "owned": True,
-        "total": liked["total"] if liked else None,
-        "queued": liked is not None,
-        "paused": bool(liked["paused"]) if liked else False,
-        "stale": False,
-        "synced_at": liked["synced_at"] if liked else None,
-        "yt_id": liked["yt_id"] if liked else None,
-        "counts": liked_counts,
-        "done": liked_counts.get(db.ADDED, 0),
-    })
-    return {"playlists": out, "hidden_not_owned": sum(1 for p in items if not p["owned"])}
+        out.append(_entry(p["id"], p["name"], p["total"], None, {}))
+
+    if sp_api.LIKED_ID not in seen:
+        out.append(_entry(sp_api.LIKED_ID, "Liked Songs", None, None, {}))
+
+    return {
+        "playlists": out,
+        "hidden_not_owned": sum(1 for p in remote if not p["owned"]),
+        "spotify_error": error,
+    }
 
 
 @app.post("/api/queue")
@@ -398,7 +431,14 @@ def playlist_tracks(playlist_id: str, status: str = "", q: str = ""):
 @app.post("/api/sync")
 def sync_everything(payload: dict = Body(default={})):
     conn = db.connect()
-    results = sync_mod.sync_all(conn, spotify(), force=bool(payload.get("force")))
+    listing = None
+    try:
+        listing = spotify_playlists()
+    except Exception:
+        pass  # fall back to per-playlist lookups
+    results = sync_mod.sync_all(
+        conn, spotify(), force=bool(payload.get("force")), listing=listing
+    )
     _spotify["playlists"] = None
     return {"results": results}
 

@@ -1,6 +1,9 @@
 """Read-only Spotify access: playlists, their tracks, and Liked Songs."""
 
 import os
+import threading
+import time
+from collections import deque
 from pathlib import Path
 
 import spotipy
@@ -10,6 +13,28 @@ SCOPE = "playlist-read-private playlist-read-collaborative user-library-read"
 CACHE = Path(__file__).parent / ".spotify_token.json"
 
 LIKED_ID = "__liked__"  # pseudo playlist id for Liked Songs
+
+
+# Apps in Spotify's development mode get a low request ceiling, and spotipy
+# retries 429 by default - each retry spends more of the same budget. Pace our
+# own calls so a burst never reaches that point.
+MAX_CALLS, WINDOW = 20, 30.0
+_calls = deque()
+_gate_lock = threading.Lock()
+
+
+def throttle():
+    """Block briefly if we are about to exceed our self-imposed call rate."""
+    while True:
+        with _gate_lock:
+            now = time.monotonic()
+            while _calls and now - _calls[0] > WINDOW:
+                _calls.popleft()
+            if len(_calls) < MAX_CALLS:
+                _calls.append(now)
+                return
+            wait = WINDOW - (now - _calls[0])
+        time.sleep(min(wait, 2.0))
 
 
 class RateLimited(Exception):
@@ -44,6 +69,7 @@ def current_user_id(sp):
     pushed us into Spotify's rate limit."""
     key = id(sp)
     if key not in _ME:
+        throttle()
         _ME[key] = sp.current_user()["id"]
     return _ME[key]
 
@@ -66,6 +92,7 @@ def playlists(sp):
     me = current_user_id(sp)
     out, offset = [], 0
     while True:
+        throttle()
         page = sp.current_user_playlists(limit=50, offset=offset)
         for p in page["items"]:
             # Spotify occasionally returns sparse or null entries here.
@@ -83,8 +110,18 @@ def playlists(sp):
         offset += 50
 
 
-def playlist_meta(sp, playlist_id):
+def playlist_meta(sp, playlist_id, known=None):
+    """`known` は一覧取得で得た dict。渡せば追加の API 呼び出しをしない。"""
+    if known is not None:
+        return {
+            "id": known["id"],
+            "name": known["name"],
+            "total": known["total"],
+            "owned": known.get("owned", True),
+            "snapshot_id": known.get("snapshot_id"),
+        }
     if playlist_id == LIKED_ID:
+        throttle()
         page = sp.current_user_saved_tracks(limit=1)
         return {
             "id": LIKED_ID,
@@ -94,6 +131,7 @@ def playlist_meta(sp, playlist_id):
             # Liked Songs has no snapshot; the running total stands in for one.
             "snapshot_id": f"liked:{page['total']}",
         }
+    throttle()
     p = sp.playlist(playlist_id)
     return {
         "id": p.get("id", playlist_id),
@@ -108,6 +146,7 @@ def tracks(sp, playlist_id):
     """Yield (position, track dict). Local files, episodes and dead entries are skipped."""
     offset, position = 0, 0
     while True:
+        throttle()
         if playlist_id == LIKED_ID:
             page = sp.current_user_saved_tracks(limit=50, offset=offset)
             step = 50

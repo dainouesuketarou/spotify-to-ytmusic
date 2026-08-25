@@ -28,13 +28,13 @@ def stale(conn, remote):
     return row["snapshot_id"] != remote.get("snapshot_id")
 
 
-def sync_playlist(conn, sp, playlist_id, force=False):
+def sync_playlist(conn, sp, playlist_id, force=False, known=None):
     """Add newly-added songs, flag deleted ones, and refresh the stored snapshot.
 
     Returns a summary dict; "changed" is False when Spotify's snapshot already
     matched, meaning nothing was fetched.
     """
-    meta = sp_api.playlist_meta(sp, playlist_id)
+    meta = sp_api.playlist_meta(sp, playlist_id, known=known)
     row = conn.execute(
         "SELECT snapshot_id FROM playlists WHERE spotify_id = ?", (playlist_id,)
     ).fetchone()
@@ -120,8 +120,13 @@ def sync_playlist(conn, sp, playlist_id, force=False):
             "name": meta["name"], "total": total}
 
 
-def sync_all(conn, sp, force=False):
+def sync_all(conn, sp, force=False, listing=None):
+    """`listing` を渡すと snapshot の比較に一覧の情報を使うので、変更がなければ
+    Spotify への追加の問い合わせが発生しない。"""
+    by_id = {p["id"]: p for p in (listing or [])}
     return {
-        row["spotify_id"]: sync_playlist(conn, sp, row["spotify_id"], force=force)
+        row["spotify_id"]: sync_playlist(
+            conn, sp, row["spotify_id"], force=force, known=by_id.get(row["spotify_id"])
+        )
         for row in queued_playlists(conn)
     }

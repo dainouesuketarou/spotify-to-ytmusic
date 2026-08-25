@@ -116,6 +116,7 @@ body.queueonly .tk button{display:none}
       </div>
     </div>
     <div class="muted" id="hint"></div>
+    <div class="err" id="plerr" hidden style="margin-bottom:6px"></div>
     <div id="list"></div>
   </div>
 
@@ -230,17 +231,24 @@ async function loadOverview(){
 }
 
 async function loadPlaylists(refresh){
-  el('list').innerHTML = '<div class="muted">読み込み中…</div>';
+  if (!playlists.length) el('list').innerHTML = '<div class="muted">読み込み中…</div>';
   try {
     const d = await api('/api/playlists' + (refresh ? '?refresh=true' : ''));
     playlists = d.playlists;
     el('hint').textContent = d.hidden_not_owned
       ? `他人が作成した ${d.hidden_not_owned} 件は Spotify の制限で移行できないため非表示。` : '';
+    // Queued playlists still render from the local database; only the list of
+    // not-yet-queued playlists needs Spotify.
+    el('plerr').hidden = !d.spotify_error;
+    if (d.spotify_error){
+      el('plerr').textContent = d.spotify_error
+        + '（登録済みの進捗は下に表示しています。未登録のプレイリストは一時的に選べません）';
+    }
     render();
   } catch(e){
-    el('list').innerHTML = `<div class="err">${esc(e.message)}</div>`
-      + '<div class="muted" style="margin-top:6px">「再取得」で再試行できます。'
-      + '進捗の表示と自動実行には影響しません。</div>';
+    el('plerr').hidden = false;
+    el('plerr').textContent = e.message + '（「再取得」で再試行できます）';
+    if (!playlists.length) el('list').innerHTML = '<div class="muted">表示できるデータがありません。</div>';
   }
 }
 
@@ -255,6 +263,7 @@ function fold(id, kind, label, count){
 function render(){
   el('list').innerHTML = playlists.map(p => {
     const total = p.total ?? 0, done = p.done || 0, c = p.counts || {};
+    const unknownTotal = p.total === null || p.total === undefined;
     const waiting = (c.pending || 0) + (c.searched || 0);
     const pct = total ? Math.round(done / total * 100) : 0;
     const badges = [
@@ -267,7 +276,7 @@ function render(){
                  : `<input type="checkbox" data-id="${esc(p.id)}" ${selected.has(p.id)?'checked':''}>`}
       <div class="grow">
         <div class="name">${esc(p.name)}</div>
-        <div class="muted">${done}/${total} 曲 ${badges}</div>
+        <div class="muted">${unknownTotal ? '曲数不明' : done + '/' + total + ' 曲'} ${badges}</div>
         ${p.queued ? `<div class="bar" style="margin-top:6px"><i style="width:${pct}%"></i></div>` : ''}
         ${fold(p.id, 'pending,searched', 'これから移行する曲', waiting)}
         ${fold(p.id, 'unmatched', '未マッチの曲', c.unmatched || 0)}
